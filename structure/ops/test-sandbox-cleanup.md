@@ -89,7 +89,12 @@ gateway-cache writes, served-catalog invalidation and intercept `settings.json` 
 real Claude config directory, its default and the developer's override alike. Writers pass every
 directory they touch, so a sandbox child linked into the real directory is judged by its target;
 protected roots resolve at check time and compare case-insensitively on macOS and Windows. That
-directory is also a protected removal tree.
+directory is also a protected removal tree. Removal-tree containment and equality use the same
+component-aware, platform-case-folded comparison: only a leading `..` path component leaves a
+protected tree (a child named `..backup` stays inside), and case variants compare equal on
+macOS and Windows. The running-checkout content exemption is the one comparison that does NOT
+fold case: a folded ALLOW would call a distinct same-letters-different-case sibling checkout
+content on a case-sensitive volume, turning a refusal into permission.
 `tests/claude-integration/claude-config-home-isolation.test.ts` pins each layer.
 
 The write guard arms without the preload too. Bun reads `bunfig.toml` from the current working
