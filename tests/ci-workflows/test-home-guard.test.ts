@@ -49,6 +49,23 @@ const REPO_ROOT = repoRoot();
  */
 const REPO_ROOT_URL = pathToFileURL(repoRoot() + "/").href;
 
+/**
+ * Whether this host's temp volume treats case-flipped names as distinct. The case-distinct
+ * checkout-sibling regression needs two same-letters-different-case directories to coexist;
+ * on a case-insensitive volume the fold makes them one directory, the exemption legitimately
+ * applies, and the scenario cannot exist, so that one test skips there. The mock only
+ * substitutes process.platform — it never simulates the filesystem.
+ */
+const CASE_SENSITIVE_TMP = (() => {
+  const probe = mkdtempSync(join(tmpdir(), "ocx-case-probe-"));
+  try {
+    mkdirSync(join(probe, "checkout"));
+    return !existsSync(join(probe, "CHECKOUT"));
+  } finally {
+    removeTreeWithRetry(probe);
+  }
+})();
+
 // Scale only execution: cleanup retains room below CI's existing 60-second ceiling.
 const PROBE_EXECUTION_MS = watchdogMs(5_000);
 const PROBE_TERM_MS = 5_000;
@@ -746,6 +763,102 @@ const canSymlink = (() => {
       expect(() => assertRemovalOutsideProtectedTrees(ordinary)).not.toThrow();
     } finally {
       removeTreeWithRetry(ordinary);
+    }
+  });
+
+  test("a protected-tree child whose name begins with two dots is still inside the tree (#7853)", () => {
+    // `relative(home, join(home, "..backup"))` is "..backup": a string-prefix `..` check read
+    // that as an escape and judged the child OUTSIDE the tree, so the removal guard did not
+    // refuse it. Only a leading ".." path component leaves the root.
+    const home = protectedHomeForTests();
+    expect(protectedRemovalReason(join(home, "..backup"))).not.toBeNull();
+    expect(protectedRemovalReason(join(home, "..backup", "config.json"))).not.toBeNull();
+    // A real escape still resolves outside and stays unrefused.
+    expect(protectedRemovalReason(join(home, "sub", "..", "..", "ocx-guard-outside"))).toBeNull();
+  });
+
+  test("case variants of protected trees and homes are refused where the filesystem folds case (#7853)", async () => {
+    // The fold branch only runs on darwin/win32, so the probe mocks process.platform before the
+    // guard module loads (module state is captured at import). That exercises the comparison
+    // logic on any host, but it is NOT a real macOS or Windows filesystem run.
+    const probeId = beginProbe("16-case-fold-refusal");
+    const realHome = mkdtempSync(join(tmpdir(), "ocx-sentinel-casehome-"));
+    try {
+      mkdirSync(join(realHome, ".opencodex"), { recursive: true });
+      mkdirSync(join(realHome, ".codex"), { recursive: true });
+      mkdirSync(join(realHome, "Library", "LaunchAgents"), { recursive: true });
+      const probe = await runProbe(probeId, `
+        Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+        const { join, dirname, basename } = await import("node:path");
+        const guard = await import(${JSON.stringify(REPO_ROOT_URL + "src/lib/test-home-guard")});
+        const home = guard.protectedHomeForTests();
+        const variant = join(dirname(home), basename(home).toUpperCase());
+        const codexHome = guard.protectedCodexHomeForTests();
+        const codexVariant = join(dirname(codexHome), basename(codexHome).toUpperCase());
+        const launchAgents = guard.protectedLaunchAgentsDirForTests();
+        const launchVariant = join(dirname(launchAgents), basename(launchAgents).toUpperCase());
+        const throws = fn => { try { fn(); return false; } catch { return true; } };
+        console.log(JSON.stringify({
+          variantDiffers: variant !== home && codexVariant !== codexHome && launchVariant !== launchAgents,
+          removalVariant: guard.protectedRemovalReason(variant) !== null,
+          removalVariantChild: guard.protectedRemovalReason(join(variant, "config.json")) !== null,
+          writeHome: throws(() => guard.assertNotRealHomeUnderTest(variant)),
+          isProtectedHome: guard.isProtectedHomeUnderTest(variant),
+          writeCodex: throws(() => guard.assertNotRealCodexHomeUnderTest(codexVariant)),
+          writeLaunch: throws(() => guard.assertNotRealLaunchAgentsUnderTest(launchVariant)),
+          ordinary: guard.protectedRemovalReason(join(${JSON.stringify(realHome)}, "ordinary-dir")) === null,
+        }));
+      `, { OCX_REAL_HOME: realHome, OCX_TEST_HOME_GUARD: "1" });
+
+      expect(JSON.parse(probe.stdout.trim())).toEqual({
+        variantDiffers: true,
+        removalVariant: true,
+        removalVariantChild: true,
+        writeHome: true,
+        isProtectedHome: true,
+        writeCodex: true,
+        writeLaunch: true,
+        ordinary: true,
+      });
+    } finally {
+      removeTreeWithRetry(realHome);
+    }
+  });
+
+  test.skipIf(!CASE_SENSITIVE_TMP)("a case-distinct sibling of the running checkout inside a protected tree stays refused (#7853)", async () => {
+    // Regression: the deny side folds platform case, but the own-checkout ALLOW exemption must
+    // stay exact. A folded exemption would call `.opencodex/CHECKOUT` (a distinct directory on a
+    // case-sensitive volume) content of the running checkout at `.opencodex/checkout` and permit
+    // its removal. The probe imports a COPY of the guard from inside the synthetic home so the
+    // running checkout genuinely sits inside the protected tree; a symlink into the tree would
+    // give the candidate separate canonical and lexical spellings and mask the exemption path.
+    const probeId = beginProbe("17-case-sibling-not-checkout");
+    const realHome = mkdtempSync(join(tmpdir(), "ocx-sentinel-casehome-"));
+    try {
+      const moduleDir = join(realHome, ".opencodex", "checkout", "src", "lib");
+      mkdirSync(moduleDir, { recursive: true });
+      mkdirSync(join(realHome, ".opencodex", "CHECKOUT"), { recursive: true });
+      const modulePath = join(moduleDir, "test-home-guard.ts");
+      writeFileSync(modulePath, readFileSync(repoPath("src/lib/test-home-guard.ts"), "utf8"), "utf8");
+      const probe = await runProbe(probeId, `
+        Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+        const { join, dirname } = await import("node:path");
+        const { fileURLToPath } = await import("node:url");
+        const moduleUrl = ${JSON.stringify("__MODULE_URL_PLACEHOLDER__")};
+        const guard = await import(moduleUrl);
+        const checkout = dirname(dirname(dirname(fileURLToPath(moduleUrl))));
+        console.log(JSON.stringify({
+          siblingRefused: guard.protectedRemovalReason(join(checkout, "..", "CHECKOUT", "private-state")) !== null,
+          ownContentAllowed: guard.protectedRemovalReason(join(checkout, "src", "private-file.ts")) === null,
+        }));
+      `.replace("__MODULE_URL_PLACEHOLDER__", pathToFileURL(modulePath).href), { OCX_REAL_HOME: realHome, OCX_TEST_HOME_GUARD: "1" });
+
+      expect(JSON.parse(probe.stdout.trim())).toEqual({
+        siblingRefused: true,
+        ownContentAllowed: true,
+      });
+    } finally {
+      removeTreeWithRetry(realHome);
     }
   });
 
