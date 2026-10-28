@@ -191,7 +191,7 @@ function missingPreloadHint(): string {
  */
 export function isProtectedHomeUnderTest(dir: string): boolean {
   if (!isTestHomeGuardArmed()) return false;
-  return canonicalize(dir) === PROTECTED_HOME;
+  return samePathOnPlatform(canonicalize(dir), PROTECTED_HOME);
 }
 
 /**
@@ -204,7 +204,7 @@ export function isProtectedHomeUnderTest(dir: string): boolean {
  */
 export function assertNotRealHomeUnderTest(dir: string): void {
   if (!isTestHomeGuardArmed()) return;
-  if (canonicalize(dir) !== PROTECTED_HOME) return;
+  if (!samePathOnPlatform(canonicalize(dir), PROTECTED_HOME)) return;
   throw new Error(
     `refusing to write the real OpenCodex home (${PROTECTED_HOME}) from a test process. `
     + "Point OPENCODEX_HOME at a temp directory for this test, or inject persistence "
@@ -227,7 +227,7 @@ export function protectedLaunchAgentsDirForTests(): string {
  */
 export function assertNotRealLaunchAgentsUnderTest(dir: string): void {
   if (!isTestHomeGuardArmed()) return;
-  if (canonicalize(dir) !== PROTECTED_LAUNCH_AGENTS) return;
+  if (!samePathOnPlatform(canonicalize(dir), PROTECTED_LAUNCH_AGENTS)) return;
   throw new Error(
     `refusing to write the real LaunchAgents directory (${PROTECTED_LAUNCH_AGENTS}) from a test `
     + "process: os.homedir() ignores HOME, so rewriting HOME does not move this path. Pass an "
@@ -238,7 +238,7 @@ export function assertNotRealLaunchAgentsUnderTest(dir: string): void {
 /** Throw when an armed test process is about to write the real native Codex home. */
 export function assertNotRealCodexHomeUnderTest(dir: string): void {
   if (!isTestHomeGuardArmed()) return;
-  if (canonicalize(dir) !== PROTECTED_CODEX_HOME) return;
+  if (!samePathOnPlatform(canonicalize(dir), PROTECTED_CODEX_HOME)) return;
   throw new Error(
     `refusing to write the real Codex home (${PROTECTED_CODEX_HOME}) from a test process. `
     + "Point CODEX_HOME at a temp directory for this test before writing Codex files "
@@ -285,6 +285,16 @@ function foldPlatformCase(path: string): string {
   return process.platform === "darwin" || process.platform === "win32" ? path.toLowerCase() : path;
 }
 
+/**
+ * Path equality under the guard's conservative platform policy: fold on darwin/win32 (as the
+ * Claude-tree checks already do), a plain string compare elsewhere. This is an OS-level
+ * policy, not a probe of actual filesystem identity — on a case-sensitive volume it can
+ * over-refuse, which is the safe direction for a guard.
+ */
+function samePathOnPlatform(a: string, b: string): boolean {
+  return foldPlatformCase(a) === foldPlatformCase(b);
+}
+
 function isSameOrInsideIgnoringPlatformCase(root: string, candidate: string): boolean {
   const parent = foldPlatformCase(root);
   const child = foldPlatformCase(candidate);
@@ -325,7 +335,19 @@ export function protectedRemovalTreesForTests(): readonly string[] {
 /** Whether `child` sits strictly below `parent`, both already canonicalized. */
 function isInside(parent: string, child: string): boolean {
   const rel = relative(parent, child);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  // Only a leading ".." COMPONENT leaves the root: a child named "..backup" is inside it.
+  return rel !== "" && !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`);
+}
+
+/**
+ * The case-folding counterpart of {@link isInside}, used ONLY on the guard's deny side.
+ * Refusing too broadly is the guard's safe direction, so protected-tree comparisons fold
+ * platform case. The checkout-content exemption must never use this: a folded ALLOW would
+ * call a distinct same-letters-different-case sibling "checkout content" on a case-sensitive
+ * volume, turning a refusal into permission.
+ */
+function isInsideIgnoringPlatformCase(parent: string, child: string): boolean {
+  return isInside(foldPlatformCase(parent), foldPlatformCase(child));
 }
 
 let checkoutRootSpellings: readonly string[] | undefined;
@@ -387,16 +409,16 @@ export function protectedRemovalReason(target: string): string | null {
   // form still names it. Upstream Codex makes the same distinction in its writable-root
   // handling, keeping logical and resolved forms side by side rather than collapsing to one.
   for (const candidate of [canonicalize(target), resolve(target)]) {
-    if (candidate === PROTECTED_REAL_HOME || candidate === LEXICAL_REAL_HOME) {
+    if (samePathOnPlatform(candidate, PROTECTED_REAL_HOME) || samePathOnPlatform(candidate, LEXICAL_REAL_HOME)) {
       return `the real home directory (${PROTECTED_REAL_HOME})`;
     }
     for (const tree of PROTECTED_TREES) {
       for (const protectedPath of [tree.path, tree.lexical]) {
-        if (candidate === protectedPath) return `${tree.label} (${protectedPath})`;
-        if (isInside(protectedPath, candidate) && !isOwnCheckoutContent(protectedPath, candidate)) {
+        if (samePathOnPlatform(candidate, protectedPath)) return `${tree.label} (${protectedPath})`;
+        if (isInsideIgnoringPlatformCase(protectedPath, candidate) && !isOwnCheckoutContent(protectedPath, candidate)) {
           return `a path inside ${tree.label} (${protectedPath})`;
         }
-        if (isInside(candidate, protectedPath)) return `an ancestor of ${tree.label} (${protectedPath})`;
+        if (isInsideIgnoringPlatformCase(candidate, protectedPath)) return `an ancestor of ${tree.label} (${protectedPath})`;
       }
     }
     // The Claude directory is judged like its writer guard: roots resolved now, case folded
